@@ -1,0 +1,96 @@
+#!/command/with-contenv bash
+set -euo pipefail
+
+LOG_DIR="${LOG_DIR:-/workspace/logs}"
+ENV_STATE_FILE="${ENV_STATE_FILE:-/workspace/service_env.sh}"
+mkdir -p "$LOG_DIR"
+
+JUDGE_LOG="$LOG_DIR/judge.log"
+
+set -a
+source "$ENV_STATE_FILE"
+set +a
+: "${GEN_MODEL:=$JUDGE_MODEL}"
+
+: "${JUDGE_MODEL:?missing JUDGE_MODEL in $ENV_STATE_FILE}"
+: "${JUDGE_PORT:=8000}"
+: "${JUDGE_PARALLEL:=1}"
+: "${VLLM_MAX_MODEL_LEN:=12000}"
+: "${VLLM_GPU_MEM_UTIL:=0.90}"
+: "${DATA_PARALLEL_SIZE:=1}"
+: "${DATA_PARALLEL_SIZE_LOCAL:=$DATA_PARALLEL_SIZE}"
+: "${DATA_PARALLEL_BACKEND:=}"
+: "${DATA_PARALLEL_ADDRESS:=}"
+: "${DATA_PARALLEL_RPC_PORT:=13345}"
+
+VLLM_ARGS=(
+  --model "$JUDGE_MODEL"
+  --host 0.0.0.0
+  --port "$JUDGE_PORT"
+  --tensor-parallel-size "$JUDGE_PARALLEL"
+  --max-model-len "$VLLM_MAX_MODEL_LEN"
+  --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL"
+  --trust-remote-code
+)
+
+if [ "${DATA_PARALLEL_SIZE}" -gt 1 ]; then
+  VLLM_ARGS+=(--data-parallel-size "$DATA_PARALLEL_SIZE")
+  VLLM_ARGS+=(--data-parallel-size-local "$DATA_PARALLEL_SIZE_LOCAL")
+  if [ -n "${DATA_PARALLEL_BACKEND:-}" ]; then
+    VLLM_ARGS+=(--data-parallel-backend "$DATA_PARALLEL_BACKEND")
+  fi
+  if [ -n "${DATA_PARALLEL_ADDRESS:-}" ]; then
+    VLLM_ARGS+=(--data-parallel-address "$DATA_PARALLEL_ADDRESS")
+    VLLM_ARGS+=(--data-parallel-rpc-port "$DATA_PARALLEL_RPC_PORT")
+  fi
+fi
+
+echo "[vllm] Starting vLLM (model=$JUDGE_MODEL TP=$JUDGE_PARALLEL DP=$DATA_PARALLEL_SIZE)"
+
+# vLLM can leave worker subprocesses alive after the parent exits, which keeps
+# GPU memory allocated. We therefore start vLLM in its own process group and
+# on shutdown we kill the whole group (TERM then KILL) to avoid orphaned workers.
+
+if ! command -v setsid >/dev/null 2>&1; then
+  echo "[vllm] ERROR: setsid not found; install util-linux (required for reliable worker cleanup)" >&2
+  exit 1
+fi
+
+FIFO="/tmp/vllm.stdout.$$"
+rm -f "$FIFO"
+mkfifo "$FIFO"
+
+tee -a "$JUDGE_LOG" <"$FIFO" &
+TEE_PID=$!
+
+setsid python -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >"$FIFO" 2>&1 &
+VLLM_PID=$!
+
+cleanup() {
+  local grace=${VLLM_KILL_GRACE_SECS:-20}
+  local waited=0
+
+  if kill -0 "$VLLM_PID" >/dev/null 2>&1; then
+    echo "[vllm] Stopping vLLM process group (pgid=$VLLM_PID)"
+    kill -TERM -- "-$VLLM_PID" >/dev/null 2>&1 || true
+    while kill -0 "$VLLM_PID" >/dev/null 2>&1; do
+      if [ "$waited" -ge "$grace" ]; then
+        echo "[vllm] Grace expired; SIGKILL vLLM process group (pgid=$VLLM_PID)"
+        kill -KILL -- "-$VLLM_PID" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+
+  kill "$TEE_PID" >/dev/null 2>&1 || true
+  rm -f "$FIFO" || true
+}
+
+trap cleanup INT TERM
+
+wait "$VLLM_PID"
+cleanup
+wait "$TEE_PID" >/dev/null 2>&1 || true
+exit 0

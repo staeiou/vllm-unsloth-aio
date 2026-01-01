@@ -1,0 +1,99 @@
+#!/command/with-contenv bash
+set -euo pipefail
+
+LOG_DIR="${LOG_DIR:-/workspace/logs}"
+ENV_STATE_FILE="${ENV_STATE_FILE:-/workspace/service_env.sh}"
+LITELLM_CONFIG="${LITELLM_CONFIG:-/workspace/litellm.yaml}"
+mkdir -p "$LOG_DIR"
+
+LITELLM_LOG="$LOG_DIR/litellm.log"
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-600}
+
+set -a
+source "$ENV_STATE_FILE"
+set +a
+: "${GEN_MODEL:=$JUDGE_MODEL}"
+: "${JUDGE_MODEL:?missing JUDGE_MODEL in $ENV_STATE_FILE}"
+: "${JUDGE_PORT:=8000}"
+: "${LITELLM_PORT:=4000}"
+
+# One-entry config rewritten on each swap:
+# - The only model_name exposed by LiteLLM is the *real* currently-loaded vLLM
+#   model id ($JUDGE_MODEL).
+# - Callers must use the real model id, and wrong model ids fail.
+cat <<CONFIG > "$LITELLM_CONFIG"
+model_list:
+  - model_name: ${JUDGE_MODEL}
+    litellm_params:
+      # Route via LiteLLM's OpenAI-compatible provider to the local vLLM server.
+      # The upstream OpenAI 'model' field will be ${JUDGE_MODEL}.
+      model: openai/${JUDGE_MODEL}
+      api_base: http://127.0.0.1:${JUDGE_PORT}/v1
+      api_key: EMPTY
+router_settings:
+  default_model: ${JUDGE_MODEL}
+CONFIG
+
+echo "[litellm] Waiting for vLLM HTTP endpoint..."
+elapsed=0
+while true; do
+  if curl --connect-timeout 1 --max-time 2 -sSf "http://127.0.0.1:${JUDGE_PORT}/v1/models" >/dev/null; then
+    break
+  fi
+  if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
+    echo "[litellm] ERROR: vLLM health check timed out after ${HEALTH_TIMEOUT}s" >&2
+    exit 1
+  fi
+  sleep 2
+  elapsed=$((elapsed + 2))
+done
+
+echo "[litellm] Starting LiteLLM on port ${LITELLM_PORT}"
+
+# Important: do NOT use a pipeline like `litellm ... | tee ...` here.
+# Under s6, that can cause the supervised PID to be `tee` instead of LiteLLM,
+# so restarts don't actually restart LiteLLM and the old config stays live.
+
+if ! command -v setsid >/dev/null 2>&1; then
+  echo "[litellm] ERROR: setsid not found; install util-linux" >&2
+  exit 1
+fi
+
+FIFO="/tmp/litellm.stdout.$$"
+rm -f "$FIFO"
+mkfifo "$FIFO"
+
+tee -a "$LITELLM_LOG" <"$FIFO" &
+TEE_PID=$!
+
+setsid litellm --config "$LITELLM_CONFIG" --port "$LITELLM_PORT" >"$FIFO" 2>&1 &
+LITELLM_PID=$!
+
+cleanup() {
+  local grace=${LITELLM_KILL_GRACE_SECS:-10}
+  local waited=0
+
+  if kill -0 "$LITELLM_PID" >/dev/null 2>&1; then
+    echo "[litellm] Stopping LiteLLM process group (pgid=$LITELLM_PID)"
+    kill -TERM -- "-$LITELLM_PID" >/dev/null 2>&1 || true
+    while kill -0 "$LITELLM_PID" >/dev/null 2>&1; do
+      if [ "$waited" -ge "$grace" ]; then
+        echo "[litellm] Grace expired; SIGKILL LiteLLM process group (pgid=$LITELLM_PID)"
+        kill -KILL -- "-$LITELLM_PID" >/dev/null 2>&1 || true
+        break
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+
+  kill "$TEE_PID" >/dev/null 2>&1 || true
+  rm -f "$FIFO" || true
+}
+
+trap cleanup INT TERM
+
+wait "$LITELLM_PID"
+cleanup
+wait "$TEE_PID" >/dev/null 2>&1 || true
+exit 0
