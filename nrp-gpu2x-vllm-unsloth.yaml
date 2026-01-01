@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: YOURNAME-gpu2x-vllm
+  namespace: YOURNAMESPACE
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+            - key: nvidia.com/gpu.compute.major
+              operator: Gt
+              values: ["7"] # CUDA COMPUTE >=8.0, for Ampere (RTX 30 series / A10(0) and above)
+  containers:
+  - name: gpu-container
+    image: staeiou/vllm-unsloth-aio:latest
+    env:
+      - name: HF_TOKEN
+        value: ""                 # If you are downloading gated repos
+      - name: JUDGE_MODEL
+        value: "Qwen/Qwen3-4B"    # Any HF model name
+      - name: DATA_PARALLEL_SIZE
+        value: "2"
+      - name: JUDGE_PARALLEL
+        value: "1"
+      - name: HF_HOME
+        value: /workspace/.cache/huggingface
+      - name: GIT_AUTHOR_NAME    # to commit & push
+        value: "Your Name"
+      - name: GIT_AUTHOR_EMAIL
+        value: "your@email.com"
+      - name: GIT_COMMITTER_NAME
+        value: "Your Name"
+      - name: GIT_COMMITTER_EMAIL
+        value: "your@email.com"
+      - name: GITHUB_PAT
+        value: ""
+      - name: GITHUB_REPO_TO_CLONE
+        value: "staeiou/bulk-vllm-inference"
+      - name: GITHUB_USER
+        value: "username"
+      - name: HF_DATASETS_CACHE
+        value: /workspace/.cache/huggingface/datasets
+      - name: UV_CACHE_DIR
+        value: /workspace/.cache/uv
+      - name: PIP_CACHE_DIR
+        value: /workspace/.cache/pip
+    command: ["/bin/bash", "-lc"]
+    args:
+    - |
+      git clone https://$GITHUB_USER:$GITHUB_PAT@github.com/$GITHUB_REPO_TO_CLONE && exec /usr/local/bin/entrypoint.sh /usr/local/bin/start_services.sh
+    resources:
+      limits:
+        nvidia.com/gpu: 2
+        cpu: "12"
+        memory: 32Gi
+        ephemeral-storage: 158Gi
+      requests:
+        nvidia.com/gpu: 2
+        cpu: "8"
+        memory: 32Gi
+        ephemeral-storage: 158Gi
+    volumeMounts:
+      - name: hfhome-ephemeral
+        mountPath: /workspace
+      - name: dshm
+        mountPath: /dev/shm
+  volumes:
+    - name: hfhome-ephemeral
+      emptyDir:
+        sizeLimit: 150Gi
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
+  restartPolicy: Never
