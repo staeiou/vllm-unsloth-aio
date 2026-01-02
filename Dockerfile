@@ -109,8 +109,10 @@ RUN chmod +x /usr/local/bin/pod-timeout-prompt.sh /usr/local/bin/entrypoint.sh /
 # setsid is required for reliably killing the full vLLM worker process group on
 # model swap/restart (prevents orphaned workers holding GPU memory).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends util-linux && \
+    apt-get install -y --no-install-recommends util-linux ripgrep && \
     rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://ollama.com/install.sh | sh
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
