@@ -15,6 +15,7 @@ spec:
   containers:
   - name: gpu-container
     image: staeiou/vllm-unsloth-aio:latest
+    imagePullPolicy: Always
     env:
       - name: HF_TOKEN
         value: ""                 # If you are downloading gated repos
