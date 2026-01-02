@@ -3,13 +3,6 @@ FROM nvidia/cuda:12.9.1-runtime-ubuntu22.04
 SHELL ["/bin/bash", "-lc"]
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Prefer host-mounted NVIDIA driver libraries at runtime (Kubernetes + NVIDIA Container Toolkit).
-# This avoids accidentally using NVML (libnvidia-ml) baked into the image, which can mismatch the node driver
-# on a mixed-driver cluster and trigger: "Failed to initialize NVML: Driver/library version mismatch".
-ENV LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/local/cuda/lib64:/usr/local/cuda/lib"
-# Ensure NVML/nvidia-smi get mounted by NVIDIA Container Toolkit at runtime.
-ENV NVIDIA_DRIVER_CAPABILITIES="compute,utility"
-
 
 # --------------------------------------------------------------------
 # System deps + Python + Node (no conda, no nvm)
@@ -18,19 +11,11 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3 python3-venv python3-dev python3-pip \
       build-essential git curl wget cmake jq \
-      libcurl4-openssl-dev ca-certificates gnupg \
+      libcurl4-openssl-dev ca-certificates gnupg ripgrep \
       net-tools less zip nano tmux htop nvtop iotop jnettop pciutils \
       libgomp1 libnuma1 libstdc++6 xz-utils && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
-    # nvtop pulls in NVML (libnvidia-ml) via distro packages; when baked into the image this can
-    # mismatch the node driver across a mixed-driver cluster. Keep nvtop, but force NVML to come
-    # from the host via NVIDIA Container Toolkit mounts.
-    rm -f /usr/lib/*/libnvidia-ml.so* /lib/*/libnvidia-ml.so* || true && \
-    find /usr/lib /lib -type f -name 'libnvidia-ml.so*' -delete 2>/dev/null || true && \
-    # Also remove CUDA stub NVML libs if present (these are for link-time only and can break runtime).
-    find /usr/local/cuda /usr/local/cuda-* -type f -path '*/stubs/libnvidia-ml.so*' -delete 2>/dev/null || true && \
-    ldconfig || true && \
     rm -rf /var/lib/apt/lists/*
 
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
@@ -124,10 +109,8 @@ RUN chmod +x /usr/local/bin/pod-timeout-prompt.sh /usr/local/bin/entrypoint.sh /
 # setsid is required for reliably killing the full vLLM worker process group on
 # model swap/restart (prevents orphaned workers holding GPU memory).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends util-linux ripgrep && \
+    apt-get install -y --no-install-recommends util-linux && \
     rm -rf /var/lib/apt/lists/*
-
-RUN curl -fsSL https://ollama.com/install.sh | sh
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
